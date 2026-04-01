@@ -40,7 +40,9 @@ VERIFY_PATH="${VERIFY_PATH:-}"
 SELF_SCHEDULE="${SELF_SCHEDULE:-true}"
 UID_TOKEN_FILE="${UID_TOKEN_FILE:-${HOME}/.vault-refresh-uid-token}"
 VAULT_APPROLE_MOUNT="${VAULT_APPROLE_MOUNT:-approle}"
+VAULT_APPROLE_ROLE_NAME="${VAULT_APPROLE_ROLE_NAME:-}"
 VAULT_APPROLE_SECRET_ID_FILE="${VAULT_APPROLE_SECRET_ID_FILE:-${HOME}/.vault-approle-secret-id}"
+SECRET_ID_MIN_DAYS="${SECRET_ID_MIN_DAYS:-30}"
 
 log() { echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') $1" | tee -a "$LOG_FILE"; }
 
@@ -86,6 +88,54 @@ TOKEN=$(echo "$VAULT_RESP" | jq -r '.auth.client_token')
 TTL=$(echo "$VAULT_RESP" | jq -r '.auth.lease_duration')
 [ -n "$TOKEN" ] && [ "$TOKEN" != "null" ] || { log "ERROR: Vault auth failed: $VAULT_RESP"; exit 1; }
 log "INFO: Got Vault token (TTL: ${TTL}s)"
+
+# --- Step 1b: Rotate AppRole secret_id if nearing expiry ---
+if [ "$VAULT_AUTH_METHOD" = "approle" ] && [ -n "$VAULT_APPROLE_ROLE_NAME" ] && [ "$SECRET_ID_MIN_DAYS" -gt 0 ] 2>/dev/null; then
+  SID_LOOKUP=$(curl -s "${VAULT_ADDR}/v1/auth/${VAULT_APPROLE_MOUNT}/role/${VAULT_APPROLE_ROLE_NAME}/secret-id/lookup" \
+    -X POST -H "X-Vault-Token: $TOKEN" -H "Content-Type: application/json" \
+    -d "$(jq -n --arg sid "$APPROLE_SECRET_ID" '{"secret_id":$sid}')" 2>/dev/null) || true
+
+  SID_EXPIRATION=$(echo "$SID_LOOKUP" | jq -r '.data.expiration_time // empty' 2>/dev/null)
+
+  if [ -n "$SID_EXPIRATION" ]; then
+    EXP_EPOCH=$(date -d "$SID_EXPIRATION" +%s 2>/dev/null) || true
+    NOW_EPOCH=$(date +%s)
+
+    if [ -n "${EXP_EPOCH:-}" ]; then
+      REMAINING_DAYS=$(( (EXP_EPOCH - NOW_EPOCH) / 86400 ))
+      log "INFO: Secret ID expires in ${REMAINING_DAYS} days (threshold: ${SECRET_ID_MIN_DAYS}d)"
+
+      if [ "$REMAINING_DAYS" -lt "$SECRET_ID_MIN_DAYS" ]; then
+        log "INFO: Rotating secret_id..."
+        NEW_SID_RESP=$(curl -s "${VAULT_ADDR}/v1/auth/${VAULT_APPROLE_MOUNT}/role/${VAULT_APPROLE_ROLE_NAME}/secret-id" \
+          -X POST -H "X-Vault-Token: $TOKEN" -H "Content-Type: application/json" 2>/dev/null) || true
+        NEW_SECRET_ID=$(echo "$NEW_SID_RESP" | jq -r '.data.secret_id // empty' 2>/dev/null)
+
+        if [ -n "$NEW_SECRET_ID" ]; then
+          OLD_SID="$APPROLE_SECRET_ID"
+          echo -n "$NEW_SECRET_ID" > "$VAULT_APPROLE_SECRET_ID_FILE"
+          chmod 600 "$VAULT_APPROLE_SECRET_ID_FILE"
+          log "INFO: New secret_id written to $VAULT_APPROLE_SECRET_ID_FILE"
+
+          # Destroy old secret_id (best-effort)
+          curl -s "${VAULT_ADDR}/v1/auth/${VAULT_APPROLE_MOUNT}/role/${VAULT_APPROLE_ROLE_NAME}/secret-id/destroy" \
+            -X POST -H "X-Vault-Token: $TOKEN" -H "Content-Type: application/json" \
+            -d "$(jq -n --arg sid "$OLD_SID" '{"secret_id":$sid}')" > /dev/null 2>&1 || true
+          log "INFO: Old secret_id destroyed"
+        else
+          log "WARN: Failed to generate new secret_id (check policy includes auth/${VAULT_APPROLE_MOUNT}/role/${VAULT_APPROLE_ROLE_NAME}/secret-id)"
+        fi
+      fi
+    fi
+  else
+    SID_ERR=$(echo "$SID_LOOKUP" | jq -r '.errors[0] // empty' 2>/dev/null)
+    if [ -n "$SID_ERR" ]; then
+      log "WARN: Secret ID lookup failed: $SID_ERR (policy not applied yet?)"
+    else
+      log "WARN: Could not determine secret_id expiration, skipping rotation check"
+    fi
+  fi
+fi
 
 # --- Step 2: Verify token ---
 if [ -n "$VERIFY_PATH" ]; then
