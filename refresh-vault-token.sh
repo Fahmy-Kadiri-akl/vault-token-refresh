@@ -4,8 +4,9 @@ set -euo pipefail
 ###############################################################################
 # refresh-vault-token.sh (API-only, no CLI required)
 #
-# Rotates a Vault token using cloud identity (GCP or Azure) and updates the
-# Akeyless Vault Target via REST API. Self-schedules next run based on TTL.
+# Rotates a Vault token using cloud identity (GCP, Azure) or AppRole and
+# updates the Akeyless Vault Target via REST API. Self-schedules next run
+# based on TTL.
 #
 # Config: source a .env file or set env vars before running.
 # Dependencies: curl, jq, at (atd)
@@ -15,15 +16,22 @@ set -euo pipefail
 ENV_FILE="${ENV_FILE:-${HOME}/.vault-refresh.env}"
 [ -f "$ENV_FILE" ] && set -a && source "$ENV_FILE" && set +a
 
+# VAULT_AUTH_METHOD defaults to CLOUD_PROVIDER for backward compatibility
+VAULT_AUTH_METHOD="${VAULT_AUTH_METHOD:-${CLOUD_PROVIDER:-}}"
+
 # Validate required vars
 : "${VAULT_ADDR:?VAULT_ADDR required}"
-: "${VAULT_ROLE:?VAULT_ROLE required}"
-: "${CLOUD_PROVIDER:?CLOUD_PROVIDER required (gcp or azure)}"
+: "${VAULT_AUTH_METHOD:?VAULT_AUTH_METHOD required (gcp, azure, or approle)}"
 : "${AKEYLESS_API:?AKEYLESS_API required}"
 : "${AKEYLESS_ACCESS_ID:?AKEYLESS_ACCESS_ID required}"
 : "${AKEYLESS_ACCESS_TYPE:?AKEYLESS_ACCESS_TYPE required}"
 : "${AKEYLESS_TARGET_NAME:?AKEYLESS_TARGET_NAME required}"
 : "${VAULT_URL:?VAULT_URL required}"
+
+# VAULT_ROLE is required for cloud auth, optional for approle
+if [ "$VAULT_AUTH_METHOD" != "approle" ]; then
+  : "${VAULT_ROLE:?VAULT_ROLE required for cloud auth}"
+fi
 
 REFRESH_RATIO="${REFRESH_RATIO:-0.75}"
 MIN_MINUTES=1
@@ -31,13 +39,15 @@ LOG_FILE="${LOG_FILE:-/var/log/refresh-vault-token.log}"
 VERIFY_PATH="${VERIFY_PATH:-}"
 SELF_SCHEDULE="${SELF_SCHEDULE:-true}"
 UID_TOKEN_FILE="${UID_TOKEN_FILE:-${HOME}/.vault-refresh-uid-token}"
+VAULT_APPROLE_MOUNT="${VAULT_APPROLE_MOUNT:-approle}"
+VAULT_APPROLE_SECRET_ID_FILE="${VAULT_APPROLE_SECRET_ID_FILE:-${HOME}/.vault-approle-secret-id}"
 
 log() { echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') $1" | tee -a "$LOG_FILE"; }
 
-log "INFO: Starting Vault token refresh (${CLOUD_PROVIDER})"
+log "INFO: Starting Vault token refresh (${VAULT_AUTH_METHOD})"
 
-# --- Step 1: Get cloud identity token and authenticate to Vault ---
-if [ "$CLOUD_PROVIDER" = "gcp" ]; then
+# --- Step 1: Authenticate to Vault ---
+if [ "$VAULT_AUTH_METHOD" = "gcp" ]; then
   CLOUD_JWT=$(curl -sf \
     "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity?audience=http://vault/${VAULT_ROLE}&format=full" \
     -H "Metadata-Flavor: Google")
@@ -46,7 +56,7 @@ if [ "$CLOUD_PROVIDER" = "gcp" ]; then
   VAULT_RESP=$(curl -sf "${VAULT_ADDR}/v1/auth/gcp/login" -X POST \
     -d "$(jq -n --arg role "$VAULT_ROLE" --arg jwt "$CLOUD_JWT" '{"role":$role,"jwt":$jwt}')")
 
-elif [ "$CLOUD_PROVIDER" = "azure" ]; then
+elif [ "$VAULT_AUTH_METHOD" = "azure" ]; then
   METADATA=$(curl -sf 'http://169.254.169.254/metadata/instance/compute?api-version=2021-02-01' -H Metadata:true)
   SUB=$(echo "$METADATA" | jq -r '.subscriptionId')
   RG=$(echo "$METADATA" | jq -r '.resourceGroupName')
@@ -57,8 +67,19 @@ elif [ "$CLOUD_PROVIDER" = "azure" ]; then
   VAULT_RESP=$(curl -sf "${VAULT_ADDR}/v1/auth/azure/login" -X POST \
     -d "$(jq -n --arg role "$VAULT_ROLE" --arg jwt "$CLOUD_JWT" --arg sub "$SUB" --arg rg "$RG" --arg vm "$VM" \
       '{"role":$role,"jwt":$jwt,"subscription_id":$sub,"resource_group_name":$rg,"vm_name":$vm}')")
+
+elif [ "$VAULT_AUTH_METHOD" = "approle" ]; then
+  : "${VAULT_APPROLE_ROLE_ID:?VAULT_APPROLE_ROLE_ID required for approle auth}"
+  [ -f "$VAULT_APPROLE_SECRET_ID_FILE" ] || { log "ERROR: AppRole secret_id file not found: $VAULT_APPROLE_SECRET_ID_FILE"; exit 1; }
+  APPROLE_SECRET_ID=$(cat "$VAULT_APPROLE_SECRET_ID_FILE")
+  [ -n "$APPROLE_SECRET_ID" ] || { log "ERROR: AppRole secret_id file is empty"; exit 1; }
+
+  VAULT_RESP=$(curl -sf "${VAULT_ADDR}/v1/auth/${VAULT_APPROLE_MOUNT}/login" -X POST \
+    -d "$(jq -n --arg rid "$VAULT_APPROLE_ROLE_ID" --arg sid "$APPROLE_SECRET_ID" \
+      '{"role_id":$rid,"secret_id":$sid}')")
+
 else
-  log "ERROR: Unsupported CLOUD_PROVIDER=$CLOUD_PROVIDER"; exit 1
+  log "ERROR: Unsupported VAULT_AUTH_METHOD=$VAULT_AUTH_METHOD (use gcp, azure, or approle)"; exit 1
 fi
 
 TOKEN=$(echo "$VAULT_RESP" | jq -r '.auth.client_token')
@@ -97,13 +118,15 @@ if [ "$AKEYLESS_ACCESS_TYPE" = "universal_identity" ]; then
   fi
 else
   # Cloud identity auth (GCP or Azure)
-  if [ "$CLOUD_PROVIDER" = "gcp" ]; then
+  if [ "$VAULT_AUTH_METHOD" = "gcp" ]; then
     AKL_CLOUD_JWT=$(curl -sf \
       "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity?audience=akeyless.io&format=full" \
       -H "Metadata-Flavor: Google")
     B64_CLOUD_ID=$(echo -n "$AKL_CLOUD_JWT" | base64 -w0)
-  elif [ "$CLOUD_PROVIDER" = "azure" ]; then
+  elif [ "$VAULT_AUTH_METHOD" = "azure" ]; then
     B64_CLOUD_ID=$(echo -n "$CLOUD_JWT" | base64 -w0)
+  elif [ "$VAULT_AUTH_METHOD" = "approle" ]; then
+    log "ERROR: AppRole does not provide cloud identity for Akeyless. Set AKEYLESS_ACCESS_TYPE=universal_identity"; exit 1
   fi
 
   AKL_RESP=$(curl -sf "${AKEYLESS_API}/auth" \
