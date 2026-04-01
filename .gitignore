@@ -1,0 +1,26 @@
+# Environment files with credentials
+.env
+*.env
+!.env.example
+
+# Log files
+*.log
+
+# Temp files
+*.tmp
+*.bak
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Service account keys
+*.json
+!package.json
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
